@@ -1,0 +1,9 @@
+[Unit]
+Description=Check OneDrive services, bind identity, and observed sync health
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -B %h/.local/bin/onedrive-health-check
+UMask=0077
+TimeoutStartSec=45s
+TimeoutStopSec=5s

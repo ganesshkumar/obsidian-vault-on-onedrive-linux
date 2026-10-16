@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically check OneDrive health and notify the desktop user
+
+[Timer]
+OnStartupSec=3min
+OnUnitInactiveSec=2min
+AccuracySec=15s
+Unit=onedrive-health-check.service
+
+[Install]
+WantedBy=timers.target

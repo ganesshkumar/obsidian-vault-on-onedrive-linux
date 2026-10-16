@@ -1,0 +1,17 @@
+# Local, account-specific output and operational data must never be committed.
+/build/
+/rendered/
+/private/
+/backups/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.env
+.env.*
+rclone.conf
+*.lck
+*.lst
+*.lst-*
+*.log
+.render-*/

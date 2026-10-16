@@ -1,0 +1,228 @@
+#!/usr/bin/python3 -IB
+"""Read-only OneDrive inspection plus local notification bookkeeping; never repair."""
+import argparse
+import copy
+import fcntl
+import json
+import os
+from pathlib import Path
+import stat
+import subprocess
+import sys
+import time
+
+STATE_DIR = Path.home() / '.local/state/onedrive-health'
+STATE_FILE = STATE_DIR / 'state.json'
+CLOUD = 'rclone-onedrive.service'
+BIND_TIMER = 'onedrive-offline-bind.timer'
+SYNC = 'rclone-onedrive-offline.service'
+SYNC_TIMER = 'rclone-onedrive-offline.timer'
+STALE_SECONDS = 1800
+REMINDER_SECONDS = 3600
+CONFIRMATIONS = 3
+
+
+def fresh(boot, now):
+    return dict(boot_id=boot, started=now, counts={}, alerted=[], last_notice=None,
+                last_success=None)
+
+
+def advance(previous, issues, now, boot):
+    state = copy.deepcopy(previous) if previous.get('boot_id') == boot else fresh(boot, now)
+    state['counts'] = {key: min(CONFIRMATIONS, state.get('counts', {}).get(key, 0) + 1)
+                       for key in issues}
+    confirmed = {key: issues[key] for key, count in state['counts'].items()
+                 if count >= CONFIRMATIONS}
+    old = state.get('alerted', [])
+    last = state.get('last_notice')
+    if confirmed and (sorted(confirmed) != old or last is None or now - last >= REMINDER_SECONDS):
+        return state, ('warning', confirmed)
+    if not issues and old:
+        return state, ('recovery', {})
+    return state, None
+
+
+def acknowledge(state, event, now):
+    result = copy.deepcopy(state)
+    result['alerted'] = sorted(event[1]) if event[0] == 'warning' else []
+    result['last_notice'] = now
+    return result
+
+
+def assess(snapshot, last_success, started, now):
+    issues = {}
+    if snapshot['cloud'] != 'active':
+        issues['cloud'] = 'Cloud service is not active: ' + snapshot['cloud']
+    elif not snapshot['bind_ok']:
+        issues['bind'] = 'Local Obsidian bind could not be verified: ' + snapshot.get('bind_error', '')
+    for key, label in [('bind_timer', 'Bind watchdog timer'), ('sync_timer', 'Offline sync timer')]:
+        if snapshot[key] != 'active':
+            issues[key] = label + ' is not active: ' + snapshot[key]
+    sync = snapshot['sync']
+    start = int(sync['ExecMainStartTimestampMonotonic']) / 1000000
+    end = int(sync['ExecMainExitTimestampMonotonic']) / 1000000
+    running = sync['ActiveState'] in ('active', 'activating', 'deactivating')
+    success = (sync['ActiveState'] == 'inactive' and sync['Result'] == 'success'
+               and sync['ExecMainStatus'] == '0' and start > 0 and end >= start)
+    if success:
+        last_success = max(last_success or 0, end)
+    elif not running and (sync['Result'] != 'success' or sync['ExecMainStatus'] != '0'):
+        issues['sync_failed'] = 'Latest offline sync failed: ' + sync['Result'] + ', exit ' + sync['ExecMainStatus']
+    reference = last_success if last_success is not None else started
+    if now - reference >= STALE_SECONDS:
+        issues['sync_stale'] = 'No recently observed successful sync (30 minutes of awake time)'
+    return issues, last_success
+
+
+def units(names, user=False):
+    fields = 'Id,ActiveState,Result,ExecMainStatus,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic'
+    argv = ['/usr/bin/systemctl'] + (['--user'] if user else []) + ['show', *names, '--property=' + fields]
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=5, check=True)
+    found = {}
+    for block in result.stdout.strip().split('\n\n'):
+        props = dict(line.split('=', 1) for line in block.splitlines() if '=' in line)
+        if props.get('Id') in names:
+            found[props['Id']] = props
+    if set(found) != set(names):
+        raise ValueError('Could not read all expected units')
+    return found
+
+
+def collect():
+    system = units([CLOUD, BIND_TIMER])
+    user = units([SYNC, SYNC_TIMER], user=True)
+    snapshot = dict(cloud=system[CLOUD]['ActiveState'], bind_timer=system[BIND_TIMER]['ActiveState'],
+                    sync_timer=user[SYNC_TIMER]['ActiveState'], sync=user[SYNC], bind_ok=False)
+    if snapshot['cloud'] == 'active':
+        try:
+            result = subprocess.run(['/usr/local/bin/onedrive-offline-bind', '--check'],
+                                    capture_output=True, text=True, timeout=12)
+            snapshot['bind_ok'] = result.returncode == 0
+            if result.returncode:
+                snapshot['bind_error'] = (result.stderr or result.stdout).strip()[-250:]
+        except (OSError, subprocess.SubprocessError) as error:
+            snapshot['bind_error'] = str(error)
+    return snapshot
+
+
+def load_state(boot, now):
+    if STATE_DIR.is_symlink():
+        raise RuntimeError('Refusing a symlinked health state directory')
+    if not STATE_FILE.exists() and not STATE_FILE.is_symlink():
+        return fresh(boot, now)
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    fd = os.open(STATE_FILE, flags)
+    with os.fdopen(fd) as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > 65536:
+            raise RuntimeError('Unexpected health state file ownership/type/size')
+        try:
+            state = json.load(stream)
+            if not isinstance(state, dict) or state.get('boot_id') != boot:
+                return fresh(boot, now)
+            assert isinstance(state['started'], (int, float)) and 0 <= state['started'] <= now
+            assert isinstance(state['counts'], dict)
+            assert all(isinstance(k, str) and type(v) is int and 0 <= v <= CONFIRMATIONS for k, v in state['counts'].items())
+            assert isinstance(state['alerted'], list) and all(isinstance(k, str) for k in state['alerted'])
+            for key in ('last_notice', 'last_success'):
+                assert state[key] is None or isinstance(state[key], (int, float)) and 0 <= state[key] <= now
+            return state
+        except (ValueError, KeyError, AssertionError, TypeError):
+            print('Health bookkeeping was invalid; starting a fresh observation window.', flush=True)
+            return fresh(boot, now)
+
+
+def save_state(state):
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = STATE_DIR.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise RuntimeError('Health state directory must be owned by this user with mode 0700')
+    if STATE_FILE.is_symlink():
+        raise RuntimeError('Refusing a symlinked health state file')
+    tmp = STATE_DIR / ('state.json.next-' + str(os.getpid()))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            json.dump(state, stream, sort_keys=True)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, STATE_FILE)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def notify(summary, body):
+    env = os.environ.copy()
+    env.setdefault('DBUS_SESSION_BUS_ADDRESS', 'unix:path=/run/user/' + str(os.getuid()) + '/bus')
+    try:
+        result = subprocess.run(['/usr/bin/notify-send', '--app-name=OneDrive', '--urgency=normal',
+                                 '--expire-time=15000', summary, body], env=env,
+                                capture_output=True, text=True, timeout=4)
+        if result.returncode == 0:
+            return True
+        print('Desktop notification unavailable: ' + result.stderr.strip()[-250:], flush=True)
+    except (OSError, subprocess.SubprocessError) as error:
+        print('Desktop notification unavailable: ' + str(error), flush=True)
+    return False
+
+
+def inspect_once(check=False):
+    now = time.monotonic()
+    boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    state = load_state(boot, now)
+    try:
+        issues, last_success = assess(collect(), state.get('last_success'), state['started'], now)
+        state['last_success'] = last_success
+    except (OSError, subprocess.SubprocessError, KeyError, ValueError) as error:
+        issues = {'inspection': 'Health inspection unavailable: ' + str(error)}
+    print('OneDrive health: ' + ('OK' if not issues else 'ISSUES: ' + '; '.join(issues.values())), flush=True)
+    if state.get('last_success') is not None:
+        print('Last observed completed sync age (awake minutes): %.1f' % ((now - state['last_success']) / 60), flush=True)
+    if check:
+        print('Read-only check: no state updated, notification sent, or repair attempted.', flush=True)
+        return 1 if issues else 0
+    state, event = advance(state, issues, now, boot)
+    if event:
+        title = 'OneDrive needs attention' if event[0] == 'warning' else 'OneDrive checks recovered'
+        body = '\n'.join(event[1].values()) if event[0] == 'warning' else 'Service, timer, bind and observed sync checks now pass.'
+        if notify(title, body):
+            state = acknowledge(state, event, now)
+    save_state(state)
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--check', action='store_true', help='Read-only check; no state or notifications')
+    group.add_argument('--test-notification', action='store_true', help='Send one test notification; no monitor state writes')
+    args = parser.parse_args()
+    if os.geteuid() == 0:
+        raise RuntimeError('Run as your normal desktop user, not root')
+    if args.test_notification:
+        return 0 if notify('OneDrive monitor test', 'Desktop notification delivery test; no services or mounts changed.') else 1
+    if args.check:
+        return inspect_once(True)
+    os.umask(0o077)
+    runtime = Path('/run/user/' + str(os.getuid()))
+    info = runtime.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+        raise RuntimeError('No trusted per-user runtime directory')
+    fd = os.open(runtime / 'onedrive-health.lock', os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print('Another health check is running; skipped.', flush=True)
+            return 0
+        return inspect_once()
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        print('Health monitor error: ' + str(error), file=sys.stderr, flush=True)
+        sys.exit(1)

@@ -1,0 +1,29 @@
+#!/usr/bin/python3 -B
+"""Read-only topology and process-reference preflight. Authenticate sudo locally."""
+from pathlib import Path
+import runpy
+import sys
+
+
+def main():
+    if Path.home() != Path('@HOME@'):
+        raise RuntimeError('Run as @USER@, not sudo python preflight.py')
+    ns = runpy.run_path(str(Path(__file__).with_name('restart-onedrive')), run_name='preflight_library')
+    host = ns['Host'](ns['Config'](Path.home()))
+    host.guarded_mounts()
+    host.authenticate()
+    result = host.inspect()
+    if result['busy'] or result['restricted']:
+        print(result)
+        raise RuntimeError('References or incomplete inspection: close holders before continuing')
+    print('No blocking application references found; topology accepted. No services or mounts changed.')
+    if result['bisync']:
+        print('Managed bisync may continue: it is independent of the cloud mount and is not stopped by this migration.')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as error:
+        print('STOP: ' + str(error), file=sys.stderr)
+        sys.exit(1)

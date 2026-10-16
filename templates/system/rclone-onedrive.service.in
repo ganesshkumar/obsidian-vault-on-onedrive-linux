@@ -1,0 +1,21 @@
+[Unit]
+Description=Mount OneDrive using rclone (as @USER@)
+Wants=network-online.target onedrive-offline-bind.service
+After=network-online.target
+RequiresMountsFor=@HOME@
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+User=@USER@
+Group=@GROUP@
+Environment=HOME=@HOME@
+ExecStart=/usr/bin/rclone mount onedrive: @HOME@/OneDrive --config=@HOME@/.config/rclone/rclone.conf --cache-dir=@HOME@/.cache/rclone --vfs-cache-mode full --vfs-cache-max-size 20G --vfs-cache-max-age 168h --dir-cache-time 5m --poll-interval 1m --allow-other
+ExecStop=/usr/bin/fusermount3 -u @HOME@/OneDrive
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=90s
+TimeoutStopSec=90s
+
+[Install]
+WantedBy=multi-user.target

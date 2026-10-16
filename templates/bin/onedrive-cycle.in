@@ -1,0 +1,28 @@
+#!/usr/bin/bash
+# Planned stop/start: a busy child aborts BEFORE requesting parent stop.
+set -euo pipefail
+work="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+[[ "$(id -un)" == @USER@ && "$HOME" == @HOME@ && "$EUID" != 0 ]]
+trap 'rc=$?; printf "STOP: controlled cycle failed. The bind timer may be paused. Report the error; do not force unmount.\n" >&2; exit "$rc"' ERR
+/usr/bin/python3 -I -B "$work/onedrive-preflight"
+systemctl is-active --quiet rclone-onedrive.service
+sudo systemctl stop onedrive-offline-bind.timer
+sudo systemctl stop onedrive-offline-bind.service
+sudo systemctl stop @BIND_UNIT_SH@
+if findmnt --kernel --nocanonicalize --mountpoint @HOME@/OneDrive/Obsidian >/dev/null; then
+    printf 'Child remains mounted; parent will not be stopped.\n' >&2
+    false
+fi
+sudo systemctl stop rclone-onedrive.service
+if findmnt --kernel --nocanonicalize --mountpoint @HOME@/OneDrive >/dev/null; then
+    printf 'Parent remains mounted; refusing a second mount.\n' >&2
+    false
+fi
+sudo systemctl start rclone-onedrive.service
+sudo systemctl start onedrive-offline-bind.service
+/usr/local/bin/onedrive-offline-bind --check
+systemctl is-active --quiet rclone-onedrive.service
+systemctl is-active --quiet @BIND_UNIT_SH@
+sudo systemctl start onedrive-offline-bind.timer
+systemctl is-active --quiet onedrive-offline-bind.timer
+printf 'CONTROLLED CYCLE COMPLETE: normal child-first stop, parent startup, correct bind, and timer verified.\n'

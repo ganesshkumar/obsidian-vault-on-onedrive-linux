@@ -1,0 +1,10 @@
+[Unit]
+Description=Ensure offline OneDrive bind mounts exist
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

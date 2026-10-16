@@ -1,0 +1,9 @@
+[Unit]
+Description=Verify and repair the local OneDrive Obsidian bind
+After=rclone-onedrive.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/onedrive-offline-bind
+TimeoutStartSec=60s
+TimeoutStopSec=5s

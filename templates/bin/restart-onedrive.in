@@ -1,0 +1,530 @@
+#!/usr/bin/python3 -B
+# Lifecycle migration: system-managed cloud mount; user-managed bisync.
+
+# ---- workflow.py ----
+#!/usr/bin/python3 -B
+"""Restart OneDrive mount, offline bind, and a verified bidirectional sync as the normal user."""
+from pathlib import Path
+import datetime
+import json
+import os
+import shutil
+import hashlib
+
+
+
+class Config:
+    def __init__(self, home):
+        self.home=Path(home)
+        self.mount=self.home/'OneDrive'
+        self.target=self.mount/'Obsidian'
+        self.offline=self.home/'.local/share/onedrive-offline/Obsidian'
+        self.state=self.home/'.cache/rclone/bisync'
+        self.session=str(self.offline).strip('/').replace('/','_')+'..onedrive_Obsidian'
+        self.lock=self.state/(self.session+'.lck')
+        self.backups=self.home/'.local/share/onedrive-recovery'
+
+
+class Recovery:
+    def __init__(self, config, host):
+        self.c=config; self.h=host; self.backup=None
+
+    def preserve_and_unlock(self):
+        lock_data=None
+        if self.c.lock.is_symlink(): raise RuntimeError('Refusing a symlinked bisync lock')
+        if self.c.lock.exists():
+            lock_data=self.c.lock.read_bytes()
+            try: lock=json.loads(lock_data)
+            except ValueError: raise RuntimeError('Lock is malformed; leaving it untouched')
+            if not isinstance(lock,dict) or lock.get('Session')!=str(self.c.state/self.c.session) or not str(lock.get('PID','')).isdigit() or int(lock.get('PID',0))<=0:
+                raise RuntimeError('Lock does not identify the expected folder pair; leaving it untouched')
+            if (Path('/proc')/str(int(lock['PID']))).exists():
+                raise RuntimeError('Lock owner PID still exists; refusing to remove a potentially live lock')
+        if self.c.backups.is_symlink(): raise RuntimeError('Refusing a symlinked recovery directory')
+        self.c.backups.mkdir(mode=0o700,parents=True,exist_ok=True)
+        os.chmod(self.c.backups,0o700)
+        self.backup=self.c.backups/('restart-'+datetime.datetime.now().strftime('%Y%m%dT%H%M%S%f'))
+        self.backup.mkdir(mode=0o700)
+        print('Private recovery backup: '+str(self.backup),flush=True)
+        shutil.copytree(self.c.offline,self.backup/'local-vault',symlinks=True)
+        state_backup=self.backup/'bisync-state'; state_backup.mkdir(mode=0o700)
+        for path in self.c.state.glob(self.c.session+'.*'):
+            if path.is_symlink() or not path.is_file(): raise RuntimeError('Unexpected state path: '+str(path))
+            shutil.copy2(path,state_backup/path.name)
+            if hashlib.sha256(path.read_bytes()).digest()!=hashlib.sha256((state_backup/path.name).read_bytes()).digest():
+                raise RuntimeError('Bisync state backup verification failed')
+        inspection=self.h.inspect()
+        if inspection['busy'] or inspection['bisync'] or inspection['restricted']:
+            raise RuntimeError('A process/reference appeared during backup; lock remains untouched')
+        if lock_data is not None:
+            if self.c.lock.read_bytes()!=lock_data: raise RuntimeError('Lock changed during recovery; refusing removal')
+            archived=self.backup/'stale-bisync.lck'
+            archived.write_bytes(lock_data)
+            if archived.read_bytes()!=lock_data: raise RuntimeError('Lock archive verification failed')
+            self.c.lock.unlink()
+            print('Confirmed stale bisync lock archived and removed from the active location.',flush=True)
+        else:
+            print('No bisync lock needs clearing.',flush=True)
+
+    def run(self):
+        print('OneDrive Recovery — mount + local bind + completed bisync',flush=True)
+        if not self.c.offline.is_dir():
+            raise RuntimeError('Offline vault is missing: '+str(self.c.offline))
+        self.h.guarded_mounts()
+        self.h.authenticate()
+        inspection=self.h.inspect()
+        if inspection['busy'] or inspection['restricted']:
+            raise RuntimeError('Close applications/terminals using OneDrive or resolve incomplete process inspection: '+str(inspection))
+        paused=False
+        try:
+            paused=True
+            self.h.pause()
+            inspection=self.h.inspect()
+            if inspection['busy'] or inspection['bisync'] or inspection['restricted']:
+                raise RuntimeError('References or a bisync process remain after stopping; refusing recovery: '+str(inspection))
+            self.preserve_and_unlock()
+            self.h.unmount_all()
+            self.h.start_mount()
+            self.h.start_bind()
+            self.h.run_sync()
+            self.h.verify()
+            self.h.resume()
+            print('✓ ONEDRIVE HEALTHY — mount, verified local bind, and completed successful bisync.',flush=True)
+        except BaseException:
+            if paused:
+                try: self.h.pause()
+                except Exception as error: print('Warning: could not fully pause background tasks: '+str(error),flush=True)
+            if self.backup: print('Recovery backup retained: '+str(self.backup),flush=True)
+            try: self.h.diagnostics()
+            except Exception as error: print('Could not collect all diagnostics: '+str(error),flush=True)
+            raise
+
+
+# ---- host_backend.py ----
+"""Conservative system backend; safe to append to the standalone recovery script."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import time
+
+MOUNT_SERVICE = 'rclone-onedrive.service'
+SYNC_SERVICE = 'rclone-onedrive-offline.service'
+SYNC_TIMER = 'rclone-onedrive-offline.timer'
+BIND_SERVICE = 'onedrive-offline-bind.service'
+BIND_TIMER = 'onedrive-offline-bind.timer'
+
+
+# Constant program, not interpolated code. Root only reads proc and emits JSON.
+PROC_INSPECT_CODE = r'''
+import json, os, sys
+
+def scan(settings):
+    out = {'busy': [], 'bisync': [], 'restricted': []}
+    ids = set(settings['ids'])
+    def relevant(link):
+        link = link.removesuffix(' (deleted)')
+        return any(link == p or link.startswith(p + '/') for p in (settings['mount'], settings['offline']))
+    def restricted(pid, operation, error):
+        out['restricted'].append({'pid': pid, 'operation': operation, 'error': str(error)})
+    for name in os.listdir('/proc'):
+        if not name.isdigit() or int(name) == os.getpid():
+            continue
+        pid = int(name)
+        base = '/proc/' + name
+        try:
+            with open(base + '/cmdline', 'rb') as stream:
+                args = [a.decode('utf-8', 'replace') for a in stream.read().split(b'\0') if a]
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            restricted(pid, 'cmdline', error)
+            continue
+        if not args:  # kernel threads and exited zombies have no userspace references
+            continue
+        if ('bisync' in args and settings['offline'] in args and 'onedrive:Obsidian' in args
+                and os.path.basename(args[0]) == 'rclone'):
+            out['bisync'].append({'pid': pid, 'argv': args})
+        if pid == settings['ignore']:
+            continue
+        for entry in ('cwd', 'root'):
+            try:
+                link = os.readlink(base + '/' + entry)
+                if relevant(link):
+                    out['busy'].append({'pid': pid, 'reference': entry, 'path': link})
+            except FileNotFoundError:
+                pass  # process exited while scanning
+            except OSError as error:
+                restricted(pid, entry, error)
+        try:
+            descriptors = os.listdir(base + '/fd')
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            restricted(pid, 'fd', error)
+            continue
+        for fd in descriptors:
+            try:
+                link = os.readlink(base + '/fd/' + fd)
+                with open(base + '/fdinfo/' + fd) as stream:
+                    info = dict(line.split(':', 1) for line in stream if ':' in line)
+                if 'mnt_id' not in info:
+                    raise ValueError('Missing fdinfo mnt_id')
+                mount_id = int(info['mnt_id'].strip())
+                if relevant(link) or mount_id in ids:
+                    out['busy'].append({'pid': pid, 'reference': 'fd/' + fd, 'path': link, 'mnt_id': mount_id})
+            except FileNotFoundError:
+                pass  # descriptor closed while scanning
+            except (OSError, ValueError) as error:
+                restricted(pid, 'fd/' + fd, error)
+    return out
+
+if __name__ == '__main__':
+    print(json.dumps(scan(json.loads(sys.argv[1]))))
+'''
+
+
+class Host:
+    sync_timeout = 1800
+    wait_timeout = 60
+
+    def __init__(self, config):
+        self.c = config
+        self.last_sync = None
+
+    def command(self, argv, timeout=30, capture=True, check=True):
+        try:
+            result = subprocess.run(argv, timeout=timeout, text=True,
+                                    capture_output=capture, check=False)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise RuntimeError('Command could not complete: ' + str(argv[:4])) from error
+        if check and result.returncode:
+            raise RuntimeError('Command failed: ' + str(argv[:5]) + ': ' + (result.stderr or '')[-2000:])
+        return result
+
+    def now(self):
+        return time.monotonic()
+
+    def sleep(self, seconds):
+        time.sleep(seconds)
+
+    def ctl(self, *args, user=True, check=True):
+        if MOUNT_SERVICE in args:
+            user = False
+        prefix = ['/usr/bin/systemctl', '--user'] if user else ['/usr/bin/sudo', '-n', '/usr/bin/systemctl']
+        return self.command(prefix + list(args), timeout=120 if args and args[0]=='stop' else 30, check=check)
+
+    def properties(self, unit, user=True):
+        fields = 'ActiveState,SubState,Result,MainPID,ExecMainStatus,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic,ExecStart,Type'
+        text = self.ctl('show', unit, '--property=' + fields, user=user).stdout
+        return dict(line.split('=', 1) for line in text.splitlines() if '=' in line)
+
+    @staticmethod
+    def successful(p):
+        try:
+            return (int(p['ExecMainStartTimestampMonotonic']) > 0
+                    and int(p['ExecMainExitTimestampMonotonic']) >= int(p['ExecMainStartTimestampMonotonic'])
+                    and p['ActiveState'] == 'inactive' and p['SubState'] == 'dead'
+                    and p['Result'] == 'success' and p['ExecMainStatus'] == '0')
+        except (KeyError, ValueError):
+            return False
+
+    def inspect(self):
+        p = self.properties(SYNC_SERVICE)
+        try:
+            main_pid = int(p['MainPID'])
+        except (KeyError, ValueError) as error:
+            raise RuntimeError('Cannot determine managed bisync MainPID') from error
+        settings = dict(mount=str(self.c.mount), offline=str(self.c.offline),
+                        ids=[m['id'] for m in self.mounts() if m['mount'] in (str(self.c.mount), str(self.c.target))],
+                        ignore=main_pid if p.get('ActiveState') in ('active', 'activating') else 0)
+        raw = self.command(['/usr/bin/sudo', '-n', '/usr/bin/python3', '-I', '-B', '-c',
+                            PROC_INSPECT_CODE, json.dumps(settings)], timeout=60).stdout
+        try:
+            result = json.loads(raw)
+            if (not isinstance(result, dict) or set(result) != {'busy', 'bisync', 'restricted'}
+                    or any(not isinstance(v, list) for v in result.values())
+                    or any(not isinstance(item, dict) or type(item.get('pid')) is not int
+                           for values in result.values() for item in values)):
+                raise ValueError('invalid inspection shape')
+        except (ValueError, TypeError) as error:
+            raise RuntimeError('Unknown process inspection result; refusing recovery') from error
+        return result
+
+    def diagnostics(self):
+        for unit in (SYNC_SERVICE, MOUNT_SERVICE):
+            scope = ['--user'] if unit == SYNC_SERVICE else []
+            for argv in (['/usr/bin/systemctl'] + scope + ['status', '--no-pager', '--full', unit],
+                         ['/usr/bin/journalctl'] + scope + ['--unit=' + unit, '--lines=40', '--no-pager']):
+                try:
+                    result = self.command(argv, timeout=10, check=False)
+                    print('Diagnostics: ' + ' '.join(argv), flush=True)
+                    if result.stdout:
+                        print(result.stdout[-12000:], flush=True)
+                    if result.stderr:
+                        print(result.stderr[-2000:], flush=True)
+                    if result.returncode:
+                        print('Diagnostic command exit status: ' + str(result.returncode), flush=True)
+                except Exception as error:
+                    print('Diagnostics unavailable: ' + str(error), flush=True)
+
+    def authenticate(self):
+        if os.geteuid() == 0:
+            raise RuntimeError('Run recovery as the normal desktop user, not root')
+        # Inherited terminal stdin; passwords are never captured or processed.
+        self.command(['/usr/bin/sudo', '-v'], timeout=120, capture=False)
+
+    def preflight(self):
+        import re
+        import shlex
+        properties = self.properties(SYNC_SERVICE)
+        required = ('ActiveState', 'SubState', 'Result', 'ExecMainStatus',
+                    'ExecMainStartTimestampMonotonic', 'ExecMainExitTimestampMonotonic')
+        if properties.get('Type') != 'oneshot' or any(k not in properties for k in required):
+            raise RuntimeError('Unsupported sync unit fields; require oneshot and completion timestamp/status properties')
+        try:
+            for key in ('ExecMainStatus', 'ExecMainStartTimestampMonotonic', 'ExecMainExitTimestampMonotonic'):
+                if int(properties[key]) < 0:
+                    raise ValueError('negative unit timestamp/status')
+        except (ValueError, TypeError) as error:
+            raise RuntimeError('Unsupported sync completion timestamp/status fields') from error
+        value = properties.get('ExecStart', '')
+        matches = re.findall(r'argv\[\]=(.*?) ;', value)
+        if len(matches) != 1 or value.count('argv[]=') != 1 or '\\' in matches[0]:
+            raise RuntimeError('Unsupported sync ExecStart format; cannot safely verify folder pair')
+        try:
+            argv = shlex.split(matches[0])
+        except ValueError as error:
+            raise RuntimeError('Unsupported sync ExecStart quoting') from error
+        if (len(argv) < 4 or argv[:2] != ['/usr/bin/rclone', 'bisync']
+                or argv[2:4] != [str(self.c.offline), 'onedrive:Obsidian']):
+            raise RuntimeError('Sync ExecStart does not match the expected offline/onedrive:Obsidian pair')
+        forbidden = ('-1', '--resync', '--force', '--workdir', '--config', '--cache-dir')
+        if any(a.split('=', 1)[0] in forbidden or a.startswith(('--force-', '--resync-')) for a in argv[4:]):
+            raise RuntimeError('Sync unit contains forbidden recovery or custom state/config options')
+        return {'sync_unit': SYNC_SERVICE, 'ExecStart': value}
+
+    def pause(self):
+        errors = []
+        for unit, user in ((SYNC_TIMER, True), (BIND_TIMER, False), (SYNC_SERVICE, True), (BIND_SERVICE, False)):
+            try:
+                self.ctl('stop', unit, user=user)
+            except Exception as error:
+                errors.append(str(error))
+        if errors:
+            raise RuntimeError('Could not pause all tasks: ' + '; '.join(errors))
+
+    def resume(self):
+        if not self.last_sync:
+            raise RuntimeError('Cannot resume timers without a completed sync proof')
+        self.verify()
+        self.authenticate()
+        for unit, user in ((BIND_TIMER, False), (SYNC_TIMER, True)):
+            self.ctl('start', unit, user=user)
+            if self.properties(unit, user=user).get('ActiveState') != 'active':
+                raise RuntimeError('Timer did not become active: ' + unit)
+
+    @staticmethod
+    def parse_mountinfo(text):
+        import re
+        def decode(value):
+            return re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), value)
+        entries = []
+        try:
+            for line in text.splitlines():
+                left, right = line.split(' - ', 1)
+                a, b = left.split(), right.split()
+                entries.append(dict(id=int(a[0]), parent=int(a[1]), dev=a[2], root=decode(a[3]),
+                                    mount=decode(a[4]), type=b[0], source=decode(b[1])))
+        except (ValueError, IndexError) as error:
+            raise RuntimeError('Cannot parse mountinfo safely') from error
+        return entries
+
+    def mounts(self):
+        return self.parse_mountinfo(Path('/proc/self/mountinfo').read_text())
+
+    def guarded_mounts(self):
+        entries = self.mounts()
+        relevant = [m for m in entries if m['mount'] == str(self.c.mount) or m['mount'].startswith(str(self.c.mount) + '/')]
+        if any(m['mount'] not in (str(self.c.mount), str(self.c.target)) for m in relevant):
+            raise RuntimeError('Nested/unexpected mount beneath OneDrive; refusing unmount')
+        for path in (self.c.mount, self.c.target):
+            if sum(m['mount'] == str(path) for m in relevant) > 1:
+                raise RuntimeError('Stacked mounts are not supported')
+        fuse = next((m for m in relevant if m['mount'] == str(self.c.mount)), None)
+        bind = next((m for m in relevant if m['mount'] == str(self.c.target)), None)
+        if fuse and (fuse['type'] != 'fuse.rclone' or fuse['source'] != 'onedrive:' or fuse['root'] != '/'):
+            raise RuntimeError('Unexpected OneDrive mount type/source')
+        if bind and (not fuse or bind['parent'] != fuse['id'] or not self.bind_ready(entries)):
+            raise RuntimeError('Unexpected bind source/identity')
+        return fuse, bind
+
+    def identity(self, path):
+        # Separate bounded process: stat on a wedged FUSE must not hang recovery.
+        code = 'import os,sys,json;s=os.stat(sys.argv[1]);print(json.dumps([str(os.major(s.st_dev))+":"+str(os.minor(s.st_dev)),s.st_ino,s.st_mode]))'
+        try:
+            value = json.loads(self.command(['/usr/bin/python3', '-I', '-B', '-c', code, str(path)], timeout=5).stdout)
+            import stat
+            if len(value) != 3 or not stat.S_ISDIR(value[2]):
+                raise ValueError('not a directory')
+            return value[0], value[1]
+        except (ValueError, TypeError) as error:
+            raise RuntimeError('Cannot establish directory identity: ' + str(path)) from error
+
+    def bind_ready(self, entries=None):
+        entries = self.mounts() if entries is None else entries
+        bind = [m for m in entries if m['mount'] == str(self.c.target)]
+        if len(bind) != 1:
+            return False
+        source = self.identity(self.c.offline)
+        # Btrfs can expose a different anonymous device in mountinfo than stat().
+        # The bind is identified by matching both paths' stat device/inode, not by that mountinfo number.
+        return self.identity(self.c.target) == source
+
+    def unmount_all(self):
+        fuse, bind = self.guarded_mounts()
+        if bind:
+            self.command(['/usr/bin/sudo', '-n', '/usr/bin/umount', str(self.c.target)])
+            if any(m['mount'] == str(self.c.target) for m in self.mounts()):
+                raise RuntimeError('Bind remained mounted after normal umount')
+        self.ctl('stop', MOUNT_SERVICE)
+        fuse, bind = self.guarded_mounts()
+        if bind:
+            raise RuntimeError('Bind reappeared while stopping mount')
+        if fuse:
+            self.command(['/usr/bin/fusermount3', '-u', str(self.c.mount)])
+        if any(m['mount'] == str(self.c.mount) or m['mount'].startswith(str(self.c.mount)+'/') for m in self.mounts()):
+            raise RuntimeError('OneDrive mounts remain after normal unmount')
+
+    def start_mount(self):
+        self.ctl('reset-failed', MOUNT_SERVICE)
+        self.ctl('start', MOUNT_SERVICE, '--no-block')
+        deadline = self.now() + self.wait_timeout
+        while self.now() < deadline:
+            p = self.properties(MOUNT_SERVICE)
+            fuse, bind = self.guarded_mounts()
+            if p.get('ActiveState') == 'active' and p.get('Type') == 'notify' and fuse:
+                return
+            if p.get('ActiveState') == 'failed':
+                raise RuntimeError('OneDrive mount service failed')
+            self.sleep(1)
+        raise RuntimeError('Timed out waiting for notify-active exact fuse.rclone mount')
+
+    def cloud_ready(self):
+        try:
+            self.identity(self.c.target)
+            return True
+        except RuntimeError:
+            return False
+
+    def start_bind(self):
+        deadline = self.now() + self.wait_timeout
+        while self.now() < deadline:
+            if self.cloud_ready():
+                break
+            self.sleep(1)
+        else:
+            raise RuntimeError('Cloud Obsidian directory is unavailable')
+        self.ctl('start', BIND_SERVICE, '--no-block', user=False)
+        deadline = self.now() + self.wait_timeout
+        try:
+            while self.now() < deadline:
+                if self.bind_ready():
+                    self.guarded_mounts()
+                    return
+                self.sleep(1)
+            raise RuntimeError('Timed out waiting for correct local bind identity')
+        except BaseException:
+            # Existing unit has no timeout; cancel a potentially queued/running job.
+            self.ctl('stop', BIND_SERVICE, user=False)
+            raise
+
+    def verify(self):
+        if not self.last_sync:
+            raise RuntimeError('No completed bisync proof')
+        p = self.properties(MOUNT_SERVICE)
+        fuse, bind = self.guarded_mounts()
+        if p.get('ActiveState') != 'active' or p.get('Type') != 'notify' or not fuse or not bind:
+            raise RuntimeError('Mount/bind verification failed')
+        current = self.properties(SYNC_SERVICE)
+        if not self.successful(current) or any(current.get(k) != self.last_sync.get(k) for k in ('ExecMainStartTimestampMonotonic', 'ExecMainExitTimestampMonotonic')):
+            raise RuntimeError('Bisync proof changed or a later run failed')
+        return True
+
+    def run_sync(self):
+        self.last_sync = None
+        before = self.properties(SYNC_SERVICE)
+        if before.get('ActiveState') not in ('inactive', 'failed'):
+            raise RuntimeError('Bisync must be inactive before requesting a new run')
+        try:
+            previous = int(before['ExecMainStartTimestampMonotonic'])
+        except (KeyError, ValueError) as error:
+            raise RuntimeError('Unsupported sync timestamp properties') from error
+        self.ctl('reset-failed', SYNC_SERVICE)
+        self.ctl('start', SYNC_SERVICE, '--no-block')
+        deadline = self.now() + self.sync_timeout
+        while self.now() < deadline:
+            p = self.properties(SYNC_SERVICE)
+            try:
+                fresh = int(p['ExecMainStartTimestampMonotonic']) > previous
+            except (KeyError, ValueError) as error:
+                raise RuntimeError('Unsupported sync timestamp properties') from error
+            if fresh and self.successful(p):
+                self.last_sync = dict(p)
+                return
+            if p.get('ActiveState') == 'failed' or (fresh and p.get('ActiveState') == 'inactive'):
+                raise RuntimeError('Bisync failed or returned an invalid completion proof: ' + str(p))
+            self.sleep(1)
+        raise RuntimeError('Timed out waiting for a NEW completed successful bisync')
+
+
+# ---- cli_fragment.py ----
+# Appended after the tested orchestration and backend to make one standalone installed command.
+import argparse
+import fcntl
+import signal
+import sys
+
+
+def main(argv=None):
+    parser=argparse.ArgumentParser(description='Restart the OneDrive mount, local Obsidian bind, and a completed bisync. Run as your normal user; sudo is used only for system operations.')
+    parser.add_argument('--check',action='store_true',help='Read-only unit/state preflight; no sudo, backups, lock removal, or restart')
+    parser.add_argument('--version',action='version',version='restart-onedrive 2.1-system-mount')
+    args=parser.parse_args(argv)
+    if os.geteuid()==0:
+        raise RuntimeError('Run restart-onedrive as your normal user, not sudo restart-onedrive. It requests sudo locally when needed.')
+    c=Config(Path.home()); host=Host(c)
+    if c.offline.is_symlink() or not c.offline.is_dir():
+        raise RuntimeError('Expected a real offline-vault directory: '+str(c.offline))
+    for suffix in ('.path1.lst','.path2.lst'):
+        path=c.state/(c.session+suffix)
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError('Saved bisync listing is missing or symlinked. Refusing an automatic resync: '+str(path))
+    host.preflight()
+    host.guarded_mounts()
+    if args.check:
+        print('Expected mount/bisync units and saved listings found.')
+        print('Bisync lock present: '+str(c.lock.is_file()))
+        print('No files changed; no service, mount, or cloud operation executed.')
+        return
+    runtime=Path(os.environ.get('XDG_RUNTIME_DIR') or '/run/user/'+str(os.getuid()))
+    if runtime.is_symlink() or not runtime.is_dir() or runtime.stat().st_uid!=os.getuid() or runtime.stat().st_mode & 0o022:
+        raise RuntimeError('No trusted per-user runtime directory; run from your normal desktop login')
+    lock_path=runtime/'restart-onedrive.lock'
+    if lock_path.is_symlink(): raise RuntimeError('Refusing a symlinked recovery-run lock')
+    def interrupted(signum,frame): raise KeyboardInterrupt('Interrupted')
+    signal.signal(signal.SIGTERM,interrupted)
+    os.umask(0o077)
+    with lock_path.open('a') as run_lock:
+        try: fcntl.flock(run_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError: raise RuntimeError('Another restart-onedrive recovery is already running')
+        print('This restarts the three components and runs the existing bidirectional policy, including its deletion rules.',flush=True)
+        print('A private local-vault/state backup is made first. No --resync or --force is used.',flush=True)
+        Recovery(c,host).run()
+
+
+if __name__=='__main__':
+    try: main()
+    except (Exception,KeyboardInterrupt) as error:
+        print('\n✗ ERROR: '+str(error),file=sys.stderr,flush=True)
+        raise SystemExit(1)

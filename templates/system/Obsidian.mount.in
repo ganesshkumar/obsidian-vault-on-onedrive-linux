@@ -1,0 +1,14 @@
+[Unit]
+Description=Local offline Obsidian view inside OneDrive
+Requisite=rclone-onedrive.service
+After=rclone-onedrive.service
+PartOf=rclone-onedrive.service
+
+[Mount]
+What=@HOME@/.local/share/onedrive-offline/Obsidian
+Where=@HOME@/OneDrive/Obsidian
+Type=none
+Options=bind,_netdev,nofail
+TimeoutSec=10s
+LazyUnmount=no
+ForceUnmount=no

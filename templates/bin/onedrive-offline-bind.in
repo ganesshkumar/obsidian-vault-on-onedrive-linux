@@ -1,0 +1,110 @@
+#!/usr/bin/python3 -IB
+"""Verify or establish only the configured OneDrive bind; never unmount."""
+import argparse
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+SOURCE = '@HOME@/.local/share/onedrive-offline/Obsidian'
+PARENT = '@HOME@/OneDrive'
+TARGET = PARENT + '/Obsidian'
+
+
+def mounts():
+    def decode(value):
+        return re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), value)
+    entries = []
+    for line in Path('/proc/self/mountinfo').read_text().splitlines():
+        left, right = line.split(' - ', 1)
+        a, b = left.split(), right.split()
+        entries.append(dict(id=int(a[0]), parent=int(a[1]), root=decode(a[3]),
+                            target=decode(a[4]), type=b[0], source=decode(b[1])))
+    return entries
+
+
+def identity(path):
+    code = ('import os,stat,sys; s=os.stat(sys.argv[1]); '
+            'assert stat.S_ISDIR(s.st_mode), "not a directory"; '
+            'print(s.st_dev,s.st_ino)')
+    result = subprocess.run(['/usr/bin/python3', '-I', '-B', '-c', code, path],
+                            capture_output=True, text=True, timeout=4, check=True)
+    return tuple(map(int, result.stdout.split()))
+
+
+def bind():
+    if os.geteuid() != 0:
+        raise RuntimeError('Creating a missing bind requires root; use the system service')
+    subprocess.run(['/usr/bin/systemctl', 'start', @BIND_UNIT_PY@],
+                   check=True, timeout=25)
+
+
+def topology(entries):
+    relevant = [m for m in entries if m['target'] == PARENT or m['target'].startswith(PARENT + '/')]
+    if any(m['target'] not in (PARENT, TARGET) for m in relevant):
+        raise RuntimeError('Unexpected nested mount; refusing changes')
+    parents = [m for m in relevant if m['target'] == PARENT]
+    children = [m for m in relevant if m['target'] == TARGET]
+    if len(parents) != 1 or len(children) > 1:
+        raise RuntimeError('Missing parent or stacked mounts; refusing changes')
+    parent = parents[0]
+    if (parent['type'], parent['source'], parent['root']) != ('fuse.rclone', 'onedrive:', '/'):
+        raise RuntimeError('Unexpected parent filesystem/source; refusing changes')
+    if children and (children[0]['parent'] != parent['id'] or children[0]['type'] != '@LOCAL_FS_TYPE@'):
+        raise RuntimeError('Unexpected child mount topology/type; refusing changes')
+    return parent, children
+
+
+def ensure(check=False, read_mounts=mounts, probe=identity, create=bind):
+    parent, children = topology(read_mounts())
+    source = probe(SOURCE)
+    if children:
+        if probe(TARGET) != source:
+            raise RuntimeError('Wrong bind source identity; refusing changes')
+        print('Verified existing local Obsidian bind.', flush=True)
+        return
+    if check:
+        raise RuntimeError('Local bind is missing; read-only check made no changes')
+    probe(TARGET)
+    new_parent, new_children = topology(read_mounts())
+    if new_parent['id'] != parent['id'] or new_children:
+        raise RuntimeError('Mount topology changed; retry later')
+    create()
+    final_parent, final_children = topology(read_mounts())
+    if (final_parent['id'] != parent['id'] or not final_children
+            or probe(SOURCE) != source or probe(TARGET) != source):
+        raise RuntimeError('Post-mount identity/topology verification failed; inspect mounts')
+    print('Created and verified local Obsidian bind.', flush=True)
+
+
+def cloud_active():
+    result = subprocess.run(['/usr/bin/systemctl', 'show', 'rclone-onedrive.service',
+                             '--property=ActiveState', '--value'],
+                            capture_output=True, text=True, timeout=4, check=True)
+    return result.stdout.strip() == 'active'
+
+
+def repair(active=cloud_active, verify=ensure):
+    if not active():
+        print('Cloud service is not active; no bind repair requested.', flush=True)
+        return
+    verify()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--check', action='store_true', help='Read-only verification; never mount')
+    args = parser.parse_args()
+    if args.check:
+        ensure(True)
+    else:
+        repair()
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        print('Bind check failed: ' + str(error), file=sys.stderr, flush=True)
+        sys.exit(1)

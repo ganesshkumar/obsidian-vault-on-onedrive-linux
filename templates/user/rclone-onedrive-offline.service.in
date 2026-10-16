@@ -1,0 +1,16 @@
+[Unit]
+Description=Sync offline OneDrive folders
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+ExecStart=/usr/bin/rclone bisync \
+    %h/.local/share/onedrive-offline/Obsidian \
+    onedrive:Obsidian \
+    --conflict-resolve none \
+    --max-delete 25 \
+    --resilient \
+    --recover \
+    --max-lock 5m
