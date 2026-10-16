@@ -1,12 +1,13 @@
-# Publishing this local repository
+# Publish the repository
 
-Publication is separate from rendering or installing. Nothing in the renderer or
-tests creates a GitHub repository, pushes code or changes visibility. Do not publish
-until the review and privacy gates below are complete.
+Publication is a separate action from file generation and installation.
+The renderer and tests do not create a GitHub repository, push code or change visibility.
+Complete the following review before publication.
 
-## Before the first public push
+## Review before the first public push
 
-1. Run the full local suite and inspect all tracked files:
+1. Run the local tests.
+   Inspect the tracked files and history:
 
    ```sh
    python3 -B -m unittest discover -s tests -v
@@ -16,54 +17,65 @@ until the review and privacy gates below are complete.
    git log --format=fuller --all
    ```
 
-2. Review filenames, content and commit identity. Exclude personal notes, real
-   account/home paths, raw journals, OAuth config, tokens, recovery archives and
-   generated builds. Inspect all history, not just the current checkout. Gitignore
-   does not remove previously tracked secrets. If a secret has ever been committed,
-   stop and rotate it; a new ignore rule or deleting the current file is inadequate.
+2. Review filenames, file contents and commit identity.
+   Exclude personal notes, real account and home paths, raw journals, OAuth configuration, tokens, recovery archives and generated builds.
+   Inspect all history as well as the current files.
+   Gitignore does not remove secrets already tracked by Git.
+   If a secret appears in a commit, stop publication.
+   Rotate the exposed secret.
+   Removing the current file or adding an ignore rule leaves the earlier exposure unresolved.
 
-3. This repository uses a neutral local contributor identity for the prepared
-   commit. It does not change global Git identity. GitHub ownership/account names
-   remain visible in public URLs and metadata; sanitizing code cannot hide them.
+3. Check the local contributor identity in the prepared commit.
+   This repository uses a neutral identity and leaves the global Git identity unchanged.
+   Public GitHub URLs and metadata still identify the owner account.
 
-4. Confirm ignored output remains untracked:
+4. Check that generated output remains untracked:
 
    ```sh
    git check-ignore build/settings.json
    git ls-files build rendered private backups
    ```
 
-   The second command must print nothing. Absence of one generated settings file
-   is fine if you have not rendered; inspect your actual output paths as well.
+   The second command must print nothing.
+   If no settings file has been generated, its absence is expected.
+   Check any other output paths that you used.
 
-5. Require a clean working tree, a reviewed commit and a deliberate decision to
-   publish publicly. Do not use an unreviewed `git add -A` immediately before push.
-   No automated scan is a formal guarantee that a repository is safe to publish.
+5. Require a clean working tree and a reviewed commit before publication.
+   Make a deliberate decision to publish publicly.
+   Do not use an unreviewed `git add -A` immediately before a push.
+   Automated scans can miss private content.
 
-## Create a new public GitHub repository and push
+## Create and push a public repository
 
-Run this only after deciding to publish, from the repository root. Authenticate
-locally with the supported GitHub CLI workflow; never put a token into chat, source
-files or a remote URL. First inspect authentication and existing remotes:
+CAUTION: The creation command below makes the repository contents public immediately.
+Run it only after completing the review and deciding to publish.
+
+From the repository root, authenticate locally with the supported GitHub CLI workflow.
+Keep tokens out of chat, source files and remote URLs.
+Inspect authentication and existing remotes:
 
 ```sh
 gh auth status
 git remote -v
 ```
 
-If the name is unused and no conflicting origin exists:
+Confirm that the name is unused and no conflicting origin exists.
+Then run:
 
 ```sh
-gh repo create onedrive-offline-sync \
+gh repo create obsidian-vault-on-onedrive-linux \
     --source . --remote origin --public --push \
-    --description 'On-demand OneDrive mount, selected-folder bisync, bind integration and systemd health monitoring'
+    --description 'Obsidian vault sync on Linux with OneDrive, rclone, bind mounts and systemd monitoring; tested on Arch Linux'
 ```
 
-This command makes the contents public immediately. If the name exists or the
-remote conflicts, stop and inspect it; do not force-push over another project or
-change an unrelated repository's visibility. Choose an unused name deliberately.
+If the name exists or the remote conflicts, stop.
+Inspect the existing repository or remote.
+Choose another unused name if necessary.
+Do not force-push over another project or change an unrelated repository's visibility.
 
-## Read back publication
+## Verify the published repository
+
+Read the remote repository settings and commit ID:
 
 ```sh
 gh repo view --json nameWithOwner,url,visibility,defaultBranchRef
@@ -71,22 +83,28 @@ git rev-parse HEAD
 git ls-remote origin refs/heads/main
 ```
 
-Require PUBLIC visibility, default branch `main`, and matching local/remote commit
-SHAs. Then inspect the published tree, not just a successful push message:
+Require `PUBLIC` visibility and default branch `main`.
+Check that the local and remote commit SHAs match.
+Then inspect the published file tree:
 
 ```sh
 repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
 gh api "repos/$repo/git/trees/main?recursive=1" --jq '.tree[] | select(.type == "blob") | .path'
 ```
 
-Compare this inventory with `git ls-files`; ensure no generated output or private
-files appeared. There is no CI workflow included in this package: do not claim CI
-passed based on local tests, rendering or successful upload. A clean-machine install
-and real failure/recovery integration tests remain separate acceptance checks.
+Compare this file list with `git ls-files`.
+Check that the remote contains no generated output or private files.
 
-## If publication must be reversed
+This package has no CI workflow.
+Report local tests as local tests.
+A successful upload does not establish that CI passed.
+Test a new-machine installation and real failure recovery separately.
 
-Do not assume making a repository private or deleting it recalls existing clones,
-caches or forks. Rotate any exposed credentials immediately, and handle data/history
-remediation explicitly. Destructive repository deletion, force-pushing history or
-visibility changes are separate decisions, not an automatic rollback action.
+## Respond to accidental publication
+
+A visibility change or repository deletion cannot recall existing clones, caches or forks.
+If credentials were exposed, rotate them immediately.
+Review data exposure and history cleanup separately.
+
+Obtain a separate decision before deleting a repository, replacing remote history or changing visibility.
+These actions do not automatically reverse publication.

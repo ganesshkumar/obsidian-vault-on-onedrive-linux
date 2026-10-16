@@ -1,11 +1,16 @@
 # Operations, recovery and removal
 
-Use commands individually, read their output and stop on an unexpected result.
-System service queries are generally available without sudo. Local privileged
-inspection uses sudo only when you explicitly run a helper that requests it.
-Never run the entire controller as root.
+Run commands individually.
+Read each result before continuing.
+If a result is unexpected, stop.
+Investigate before continuing.
+Most system service queries work without sudo.
+Some helpers request sudo authentication for privileged local inspection.
+Run the controller as your normal user.
 
-## Daily read-only checks
+## Daily checks without state changes
+
+Inspect services, timers, bind identity and the last sync result:
 
 ```sh
 systemctl is-active rclone-onedrive.service
@@ -19,12 +24,18 @@ systemctl --user show rclone-onedrive-offline.service \
     -p ExecMainStartTimestamp -p ExecMainExitTimestamp
 ```
 
-Expect active mount/timers, verified bind identity, an `OK` health verdict, and a
-recent successful completed sync (or a currently running sync). A oneshot normally
-becomes inactive/dead after success. An active timer is not proof its job succeeds.
-`--check` does not create health state or send notifications.
+Check for these results:
 
-Targeted journals:
+- The cloud mount and timers are active.
+- The helper verifies the bind identity.
+- The health verdict is `OK`.
+- The sync completed successfully recently or is currently running.
+
+A successful oneshot service normally becomes inactive or dead after completion.
+Check its result and timestamps as well as the timer state.
+`--check` creates no health state and sends no notifications.
+
+For details, read the relevant journal:
 
 ```sh
 journalctl -u rclone-onedrive.service --no-pager -n 50
@@ -33,124 +44,169 @@ journalctl --user -u rclone-onedrive-offline.service --no-pager -n 50
 journalctl --user -u onedrive-health-check.service --no-pager -n 50
 ```
 
-Logs can contain private paths/filenames. Redact before sharing and never commit
-raw logs or credentials. Journal visibility may depend on local permissions.
+CAUTION: Logs can contain private paths and filenames.
+Remove private details before sharing them.
+Keep raw logs and credentials out of Git.
+Journal access depends on local permissions.
 
-## Understand where a missing file should travel
+## Find the transfer path for a missing file
 
-- An ordinary `~/OneDrive/...` file uses rclone VFS upload/write-back.
-- A correctly bound `~/OneDrive/Obsidian/...` file is local data, uploaded by the
-  separate bisync job. Check that job's completion and its journal.
-- If the bind is absent, the visible folder can instead be the cloud subtree.
-  Avoid editing through the convenience path until identity is verified; use
-  `~/.local/share/onedrive-offline/Obsidian` directly for offline work.
+- An ordinary file under `~/OneDrive/...` uses the rclone VFS upload process.
+- A file under a verified `~/OneDrive/Obsidian/...` bind changes the local folder.
+  Bisync uploads it separately.
+  Check the sync job's result and journal.
+- If the bind is absent, the convenience path can show the cloud folder instead.
+  Verify bind identity before editing through that path.
+  For offline work, open `~/.local/share/onedrive-offline/Obsidian` directly.
 
-The monitor does not authenticate to OneDrive or audit every file. A deliberate,
-disposable bidirectional file test is a stronger outcome check, but it changes
-cloud/local data and should be planned, not run as a read-only diagnostic.
+The monitor does not authenticate to OneDrive or compare every file.
+To check transfers in both directions, plan a separate test with disposable files.
+That test changes local and cloud data.
+Keep it separate from diagnostics that only inspect local state.
 
-## Planned mount-only cycle
+## Planned mount maintenance
 
-Close file managers, editors, shells with their working directory in either path,
-and applications using the mount. Run as your normal user:
+Close file managers, editors and other applications that use either data path.
+Close shells whose working directory is inside either path.
+Then run the cycle command as your normal user:
 
 ```sh
 onedrive-cycle
 ```
 
-This performs locally authenticated holder inspection, pauses the bind watchdog,
-stops/checks the child, and only then requests parent stop. It restarts/verifies
-the mount layer and resumes the watchdog timer. Managed bisync is independent and
-is not stopped by this mount-only cycle. It does not perform a fresh sync.
+The controller requests sudo authentication for inspection of processes that use the mounts.
+It pauses the bind watchdog, removes the child bind and checks that removal.
+It then stops and restarts the parent mount.
+After verifying the bind, it resumes the watchdog timer.
+The independent bisync job continues under its own service.
+This mount cycle performs no new sync.
 
-If the child is busy, stop and close holders instead of using lazy/forced unmount
-or killing applications. A failed child unmount is not a general systemd veto on
-parent shutdown; do not substitute a raw parent restart for this controller.
+If the child mount is busy, stop.
+Close the processes that use it before continuing.
+Do not use lazy or forced unmounts or kill applications to bypass the check.
+A failed child unmount can still be followed by an ordinary systemd parent stop.
+Use the controller's checked sequence rather than a direct parent restart.
 
-The standalone preflight is:
+To run the separate preflight check, use:
 
 ```sh
 onedrive-preflight
 ```
 
-It changes no services/mounts, but requests sudo authentication locally for process
-inspection; that authentication may update sudo's credential timestamp/audit log.
-It rejects incomplete inspection. It is not a zero-system-side-effect command.
+Preflight leaves services and mounts unchanged.
+It requests local sudo authentication to inspect processes.
+Authentication can update sudo's credential timestamp and audit log.
+If inspection is incomplete, preflight refuses to continue.
 
-## Emergency full recovery
+## Emergency recovery
 
-Use full recovery only after inspecting the specific failure and closing holders.
-Inspect prerequisites first:
+Before recovery, inspect the specific failure.
+Close processes that use the mounts.
+Check the prerequisites:
 
 ```sh
 restart-onedrive --check
 ```
 
-This mode validates configuration and mounted topology without performing repairs.
-It is not the full privileged holder inspection, a data audit or a successful-sync
-proof. Full recovery changes state and runs the normal bidirectional data policy:
+This mode validates configuration and mount layout without repairs.
+It does not perform the full privileged process inspection or compare file contents.
+It also does not establish that a sync completed.
+
+CAUTION: Full recovery changes state and runs the normal sync policy in both directions.
+It can propagate deletions and conflicts.
+
+To start full recovery, run:
 
 ```sh
 restart-onedrive
 ```
 
-Run it as the normal account, not `sudo restart-onedrive`. Enter any requested sudo
-password directly in your local terminal. The workflow:
+Run the command as your normal user.
+Do not use `sudo restart-onedrive`.
+Enter a requested sudo password directly in your local terminal.
 
-1. Checks configuration, mounted topology and application references.
-2. Pauses the sync/bind timers and stops managed sync safely.
-3. Copies local notes and saved sync state to a private timestamped recovery archive.
-4. Archives/removes only a specifically validated stale session lock.
-5. Unmounts child before parent using ordinary unmounts, then rebuilds/verifies them.
-6. Requires a fresh successful bisync, independently rechecks that completion and
-   only then resumes timers.
+The command performs this sequence:
 
-No automatic full resync, forced unmount, conflict-policy relaxation or deletion
-policy override is added. Failure can leave timers paused deliberately. Read the
-reported stage, private backup location and journals before further action.
+1. It checks configuration, mount layout and processes that use the mounts.
+2. It pauses the sync and bind timers.
+   It safely stops the managed sync.
+3. It copies local notes and saved sync state to a private recovery archive with a timestamp.
+4. It archives and removes only a validated stale session lock.
+5. It unmounts the child before the parent with ordinary unmount operations.
+   It then recreates and verifies both mounts.
+6. It waits for a new successful sync.
+   It independently checks that completion before resuming the timers.
 
-Private recovery data lives under:
+The command keeps the normal conflict and deletion policies.
+It does not add a full resync, forced unmount or deletion override.
+If recovery fails, it can leave timers paused.
+Read the reported stage, private backup location and journals before taking further action.
+
+Private recovery data uses this directory:
 
 ```text
 ~/.local/share/onedrive-recovery/
 ```
 
-Do not publish it. This recovery backup is not a complete backup of remote-only
-versions. Restoring local listings does not undo uploaded changes or deletions.
+Keep recovery data private.
+The archive contains local data and sync state.
+It does not preserve every version held only in the cloud.
+Restoring saved listings does not undo cloud uploads or deletions.
 
-An old non-expiring lock can survive a reboot. Renewable `--max-lock 5m` protects
-new lock lifecycles; it does not rewrite existing locks or override an active owner.
-A process-ID reuse can cause conservative refusal. Never delete an ambiguous lock
-or use `--resync` just to silence an error.
+An old lock without an expiry can survive a reboot.
+`--max-lock 5m` gives new locks a renewable expiry.
+It leaves existing lock data unchanged and does not override an active owner.
+If another process reuses the recorded PID, the conservative check can refuse recovery.
+Investigate ambiguous locks.
+Do not delete them or use `--resync` to bypass an error.
 
-## Existing installations and upgrades
+## Existing installations and updates
 
-This repository is not an automatic migration from older user-managed cloud mounts
-or arbitrary earlier scripts. Inventory the active system/user units, mount table,
-file holders, local/remote data, baseline state and timer status before planning a
-migration. Keep exactly one cloud owner for the parent mountpoint. Preserve the
-existing bisync pair and saved state unless a deliberate backed-up reconciliation
-is needed. Do not repeat fresh-install baseline initialization for an upgrade.
+Plan a migration before replacing an older cloud service or earlier scripts.
+Record the following state:
 
-For updates, render into a new ignored output directory, compare it with installed
-files and privately back up each destination before editing it. Decide exactly
-which units must be paused; install only reviewed changes, reload the corresponding
-manager and verify bind identity plus a new completed sync. There is no blanket
-installer or automatic rollback. Reverting configuration cannot undo data changes.
+- Active system and user units.
+- The mount table.
+- Processes that use the mounts.
+- Local and remote data.
+- Saved baseline state.
+- Timer status.
 
-## Optional removal / configuration rollback
+Keep one cloud service responsible for the parent mountpoint.
+Preserve the existing bisync pair and saved state.
+If reconciliation is necessary, back up the data before planning that change.
+Do not repeat fresh-install baseline setup for an update.
 
-This is **not part of the normal success path**. Do not run it after successful
-setup merely because it appears in documentation.
+For an update, use these steps:
 
-First make independent backups and inventory what was installed. The commands below
-assume a fresh installation using these exact standard destinations, with no
-subsequent local replacement. For an upgrade, restore your own saved configuration
-instead of blindly removing files. Keep a record of whether linger and
-`user_allow_other` predated this setup.
+1. Render into a new ignored output directory.
+2. Compare the output with the installed files.
+3. Make a private backup of each destination before changing it.
+4. Decide which units must be paused.
+5. Install only reviewed changes.
+6. Reload the applicable manager.
+7. Verify bind identity and a new completed sync.
 
-1. Stop/disable the user timers. Let any in-flight bisync finish naturally before
-   proceeding. Do not kill the job, remove its lock or delete its state.
+The project has no automatic migration or rollback installer.
+Restoring old configuration cannot undo data changes.
+
+## Remove the setup or restore configuration
+
+Use this procedure only when you intend to remove the setup or restore earlier configuration.
+After a successful installation, leave it installed.
+
+CAUTION: The removal commands assume a fresh installation at the standard destinations shown below.
+They also assume that no later local replacement has changed those files.
+
+Before removal, make independent backups.
+Record which files and units this project installed.
+For an upgraded installation, restore your saved configuration instead of removing files without checking their origin.
+Record whether linger and `user_allow_other` were enabled before this setup.
+
+### 1. Stop the user timers
+
+Disable the sync and health timers.
+Check whether a sync is still running:
 
 ```sh
 systemctl --user disable --now rclone-onedrive-offline.timer
@@ -158,17 +214,23 @@ systemctl --user disable --now onedrive-health-check.timer
 systemctl --user is-active rclone-onedrive-offline.service
 ```
 
-   If sync is active/activating, wait and inspect its journal. A failed sync also
-   needs investigation before concluding data is preserved. Once it has completed,
-   stop an in-progress health check if necessary:
+If sync is active or activating, wait for it to finish.
+Inspect its journal if necessary.
+Do not kill the job, remove its lock or delete its state.
+Investigate a failed sync before concluding that the data is preserved.
+
+After sync completes, stop a running health check if necessary:
 
 ```sh
 systemctl --user stop onedrive-health-check.service
 ```
 
-2. Close holders and stop the watchdog. Remove/check the child **before** stopping
-   the cloud service. Stop immediately on any failure; do not continue past a busy
-   child. These are separate commands, not an unattended script.
+### 2. Remove the child mount before the parent
+
+Close processes that use the mounts.
+Stop the watchdog.
+Then stop the child mount.
+Inspect the result:
 
 ```sh
 sudo systemctl disable --now onedrive-offline-bind.timer
@@ -178,17 +240,28 @@ sudo systemctl stop "$bind_unit"
 findmnt --mountpoint "$HOME/OneDrive/Obsidian"
 ```
 
-   The last command must find no mount. Only then:
+`findmnt` must show no child mount.
+If the child remains mounted or an earlier command fails, stop.
+Investigate before continuing.
+Do not continue past a busy child.
+Run these commands individually, outside an unattended script.
+
+After confirming child removal, stop the cloud service:
 
 ```sh
 sudo systemctl disable --now rclone-onedrive.service
 findmnt --mountpoint "$HOME/OneDrive"
 ```
 
-   Require no remaining parent mount. Preserve any unexpected mount and investigate.
+Check that the parent mount is gone.
+If an unexpected mount remains, leave it unchanged.
+Investigate the mount before continuing.
 
-3. After reviewing file identities and retaining configuration backups, remove only
-   the files installed by this project:
+### 3. Remove only this project's files
+
+Verify each file's identity against the installation record.
+Keep the configuration backups.
+Then remove only the files installed by this project:
 
 ```sh
 sudo rm -- /etc/systemd/system/rclone-onedrive.service \
@@ -210,12 +283,16 @@ sudo systemctl daemon-reload
 systemctl --user daemon-reload
 ```
 
-4. Keep the local notes, remote files, VFS cache, bisync listings, health state,
-   credentials and private recovery archives. No data-directory deletion is part
-   of these instructions. Verify the backing directory still contains your notes.
-   Restore a previous cloud setup only after confirming no conflicting mount.
+### 4. Keep the data and saved state
 
-5. Revert linger or `/etc/fuse.conf` only if you enabled that setting solely for
-   this setup and no other service relies on it. Use your private configuration
-   backup; do not overwrite unrelated later edits. There is no need to uninstall
-   shared packages merely to remove these units.
+Keep local notes, remote files, the VFS cache, saved bisync listings, health state, credentials and private recovery archives.
+This procedure removes no data directories.
+Check that the local folder still contains your notes.
+Before restoring an earlier cloud setup, confirm that no competing mount exists.
+
+### 5. Restore optional settings only when appropriate
+
+Restore linger or `/etc/fuse.conf` only if this setup was their sole reason and no other service requires them.
+Use your private configuration backup.
+Preserve unrelated changes made after that backup.
+Leave shared packages installed if other software uses them.
